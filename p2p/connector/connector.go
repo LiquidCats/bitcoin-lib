@@ -3,39 +3,30 @@ package connector
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
-	"os"
 	"strconv"
-	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LiquidCats/bitcoin-lib/p2p/serializer"
-	"github.com/LiquidCats/bitcoin-lib/p2p/serializer/bitcoin"
-	"github.com/LiquidCats/bitcoin-lib/p2p/serializer/payload"
 	"github.com/LiquidCats/bitcoin-lib/params"
-	"github.com/decred/dcrd/lru"
+	"github.com/decred/dcrd/container/lru"
 )
 
-var setNonce = lru.NewCache(50)
+var setNonce = lru.NewSet[uint64](50)
 
 type HashFunc func() (hash *serializer.Hash, height int32, err error)
-
-type Serializer interface {
-	Serialize(w io.Writer, msg payload.Message, pver uint32, encoding serializer.MessageEncoding) (int, error)
-	Deserialize(w io.Writer, msg payload.Message, pver uint32, encoding serializer.MessageEncoding) (int, error)
-}
 
 type Connector struct {
 	host       string
 	port       uint16
 	params     *params.Params
-	serializer Serializer
+	serializer serializer.Serializer
 	cfg        Config
 }
 
@@ -54,7 +45,7 @@ type Config struct {
 
 func NewConnector(
 	cfg Config,
-	serializer Serializer,
+	serializer serializer.Serializer,
 ) (*Connector, error) {
 	host, portStr, err := net.SplitHostPort(cfg.Address)
 	if err != nil {
@@ -79,36 +70,36 @@ func (c *Connector) ProtocolVersion() uint32 {
 
 // writeMessage creates a complete message from a command and payload (both as hex strings)
 // following the protocol header format.
-func (c *Connector) writeMessage(w io.Writer, msg payload.Message) (int, error) {
-	totalBytes := 0
-
+func (c *Connector) writeMessage(w io.Writer, msg serializer.Message) (totalBytes int, err error) {
 	body := bytes.NewBuffer([]byte{})
-	_, err := c.serializer.Serialize(body, msg, c.ProtocolVersion(), serializer.LatestEncoding)
+	err = c.serializer.Serialize(body, msg, c.ProtocolVersion(), serializer.LatestEncoding)
 	if err != nil {
-		return totalBytes, err
+		return
 	}
 
 	bodyBytes := body.Bytes()
 
 	header := bytes.NewBuffer([]byte{})
 
-	msgHeader := &bitcoin.MessageHeader{
+	msgHeader := &serializer.MessageHeader{
 		Magic:   c.params.Net,
 		Command: msg.Command(),
 		Size:    msg.MaxPayloadLength(c.ProtocolVersion()),
 	}
-	copy(msgHeader.Checksum[:], payload.Checksum(bodyBytes)[0:4])
+	copy(msgHeader.Checksum[:], serializer.Checksum(bodyBytes)[0:4])
 
-	_, err = msgHeader.Serialize(header)
+	n, err := msgHeader.Serialize(header)
 	if err != nil {
-		return totalBytes, err
-	}
-
-	n, err := w.Write(header.Bytes())
-	if err != nil {
-		return 0, err
+		return
 	}
 	totalBytes += n
+
+	n, err = w.Write(header.Bytes())
+	if err != nil {
+		return
+	}
+	totalBytes += n
+
 	if body.Len() > 0 {
 		n, err = w.Write(body.Bytes())
 		if err != nil {
@@ -122,20 +113,41 @@ func (c *Connector) writeMessage(w io.Writer, msg payload.Message) (int, error) 
 
 // readMessage creates a complete message from a command and payload (both as hex strings)
 // following the protocol header format.
-func (c *Connector) readMessage(r io.Reader, msg payload.Message) (int, error) {
-	return 0, nil
-}
+func (c *Connector) readMessageHeader(r io.Reader) (totalBytes int, msgHeader *serializer.MessageHeader, err error) {
+	msgHeader = &serializer.MessageHeader{}
 
-// readBytes reads exactly n bytes from conn.
-func readBytes(conn net.Conn, n int) []byte {
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		log.Fatal(err)
+	n, err := msgHeader.Deserialize(r)
+	if err != nil {
+		return
 	}
-	return buf
+	totalBytes += n
+
+	// Enforce maximum message payload.
+	if msgHeader.Size > serializer.MaxMessagePayload {
+		err = fmt.Errorf("ReadMessage: message payload is too large - header  indicates %d bytes, but max message payload is %d bytes.", msgHeader.Size, serializer.MaxMessagePayload)
+		return
+
+	}
+
+	// Check for messages from the wrong bitcoin network.
+	if msgHeader.Magic != c.params.Net {
+		discardInput(r, msgHeader.Size)
+		err = fmt.Errorf("ReadMessage: message from other network [%v]", msgHeader.Magic)
+		return
+	}
+
+	// Check for malformed commands.
+	command := msgHeader.Command
+	if !utf8.ValidString(command) {
+		discardInput(r, msgHeader.Size)
+		err = fmt.Errorf("ReadMessage: invalid command %v", []byte(command))
+		return
+	}
+
+	return
 }
 
-func (c *Connector) createLocalVersionMessage() (*payload.VersionPayload, error) {
+func (c *Connector) createLocalVersionMessage() (*serializer.VersionPayload, error) {
 	var blockNum int32
 	if c.cfg.NewestBlock != nil {
 		var err error
@@ -146,9 +158,9 @@ func (c *Connector) createLocalVersionMessage() (*payload.VersionPayload, error)
 	}
 
 	nonce := uint64(rand.Int63())
-	setNonce.Add(nonce)
+	setNonce.Put(nonce)
 
-	versionMsg := &payload.VersionPayload{
+	versionMsg := &serializer.VersionPayload{
 		ProtocolVersion: int32(c.ProtocolVersion()),
 		Services:        c.cfg.Services,
 		Timestamp:       time.Unix(time.Now().Unix(), 0),
@@ -191,68 +203,29 @@ func (c *Connector) Connect(_ context.Context) error {
 
 	// 3. Receive Version Message.
 	// Read the header: magic (4 bytes), command (12 bytes), size (4 bytes), checksum (4 bytes).
-	magic := readBytes(conn, 4)
-	commandBytes := readBytes(conn, 12)
-	sizeBytes := readBytes(conn, 4)
-	checksumBytes := readBytes(conn, 4)
-
-	fmt.Println("<-version")
-	fmt.Println("magic_bytes: " + hex.EncodeToString(magic))
-	// Remove padding (null bytes) from the command string.
-	fmt.Println("command:     " + strings.TrimRight(string(commandBytes), "\x00"))
-	// Interpret size as little-endian uint32.
-	sizeVal := binary.LittleEndian.Uint32(sizeBytes)
-	fmt.Println("size:        ", sizeVal)
-	fmt.Println("checksum:    " + hex.EncodeToString(checksumBytes))
-
-	// Read payload.
-	payloadData := readBytes(conn, int(sizeVal))
-	fmt.Println("payload:     " + hex.EncodeToString(payloadData))
-	fmt.Println()
+	_, err = c.readMessage(conn, &serializer.VersionPayload{})
+	if err != nil {
+		return err
+	}
 
 	// 4. Receive VerAck Message.
-	magic = readBytes(conn, 4)
-	commandBytes = readBytes(conn, 12)
-	sizeBytes = readBytes(conn, 4)
-	checksumBytes = readBytes(conn, 4)
-
-	fmt.Println("<-verack")
-	fmt.Println("magic_bytes: " + hex.EncodeToString(magic))
-	fmt.Println("command:     " + strings.TrimRight(string(commandBytes), "\x00"))
-	sizeVal = binary.LittleEndian.Uint32(sizeBytes)
-	fmt.Println("size:        ", sizeVal)
-	fmt.Println("checksum:    " + hex.EncodeToString(checksumBytes))
-	payloadData = readBytes(conn, int(sizeVal))
-	fmt.Println("payload:     " + hex.EncodeToString(payloadData))
-	fmt.Println()
+	_, err = c.readMessage(conn, &serializer.VerAckPayload{})
+	if err != nil {
+		return err
+	}
 
 	// 5. Send VeAck
-	_, err = c.writeMessage(conn, &payload.VerAckPayload{})
+	_, err = c.writeMessage(conn, &serializer.VerAckPayload{})
+	if err != nil {
+		return err
+	}
 
 	// 6. Continuously read messages.
 	for {
-		// Search for the magic bytes (4 bytes represented as 8 hex characters).
-		buffer := ""
-		for {
-			b := readBytes(conn, 1)
-			if len(b) == 0 {
-				fmt.Println("Read a nil byte from the socket. Remote node disconnected.")
-				os.Exit(1)
-			}
-			buffer += hex.EncodeToString(b)
-			if len(buffer) == 8 {
-				if buffer == "f9beb4d9" {
-					break
-				}
-				buffer = ""
-			}
-		}
+
 		// Read rest of the header.
-		cmdBytes := readBytes(conn, 12)
-		cmd := strings.TrimRight(string(cmdBytes), "\x00")
-		sizeB := readBytes(conn, 4)
-		msgSize := binary.LittleEndian.Uint32(sizeB)
-		chkB := readBytes(conn, 4)
+	msgHeader:
+		c.readMessageHeader(conn)
 		payloadData := readBytes(conn, int(msgSize))
 
 		fmt.Printf("<-%s\n", cmd)
@@ -305,5 +278,25 @@ func (c *Connector) Connect(_ context.Context) error {
 				log.Fatal(err)
 			}
 		}
+	}
+}
+
+// discardInput reads n bytes from reader r in chunks and discards the read
+// bytes.  This is used to skip payloads when various errors occur and helps
+// prevent rogue nodes from causing massive memory allocation through forging
+// header length.
+func discardInput(r io.Reader, n uint32) {
+	maxSize := uint32(10 * 1024) // 10k at a time
+	numReads := n / maxSize
+	bytesRemaining := n % maxSize
+	if n > 0 {
+		buf := make([]byte, maxSize)
+		for i := uint32(0); i < numReads; i++ {
+			io.ReadFull(r, buf)
+		}
+	}
+	if bytesRemaining > 0 {
+		buf := make([]byte, bytesRemaining)
+		io.ReadFull(r, buf)
 	}
 }
